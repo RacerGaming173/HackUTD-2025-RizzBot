@@ -7,11 +7,11 @@ from openai import OpenAI
 # Use the same device & params that worked for you
 ARECORD_CMD = [
     "arecord",
-    "-D", "plughw:3,0",
+    "-D", "plughw:2,0",
     "-f", "S16_LE",
     "-r", "16000",
     "-c", "1",
-    "-d", "5",
+    "-d", "10",
     "tmp.wav",
 ]
 
