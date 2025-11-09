@@ -20,7 +20,7 @@ client = OpenAI()
 
 
 def record_clip():
-    print("Recording 5 s...")
+    print("Recording 10 s...")
     subprocess.run(ARECORD_CMD, check=True)
     print("Recording done.")
 

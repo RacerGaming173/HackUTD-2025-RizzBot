@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import os
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple
@@ -80,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clip-seconds",
         type=float,
-        default=4.0,
-        help="Length of each recorded utterance when --mode speech is active.",
+        default=0.3,
+        help="Chunk size (seconds) sent from the microphone in speech mode.",
     )
     parser.add_argument(
         "--sample-rate",
@@ -258,39 +259,59 @@ async def handle_responses(
 ) -> None:
     if stream and not printer:
         printer = TurnPrinter()
-    if stream and printer:
-        printer.start()
-    buffer: List[str] = []
-    buffered_audio: List[Tuple[str, bytes]] = []
-    audio_seen = False
-    async for server_message in session.receive():
-        chunks = extract_text_chunks(server_message)
+    while True:
         if stream and printer:
-            printer.feed(chunks)
-        else:
-            buffer.extend(chunks)
-        audio_chunks = extract_audio_chunks(server_message)
-        if audio_player and audio_chunks:
-            audio_seen = True
-            if stream:
-                for mime, data in audio_chunks:
-                    await audio_player.play(mime, data)
+            printer.start()
+        buffer: List[str] = []
+        audio_buffer: List[bytes] = []
+        audio_mime: str | None = None
+        audio_seen = False
+
+        async def flush_audio() -> None:
+            nonlocal audio_buffer, audio_mime
+            if audio_player and audio_buffer and audio_mime:
+                await audio_player.play_buffer(audio_mime, audio_buffer)
+            audio_buffer = []
+            audio_mime = None
+
+        def should_flush(message: types.LiveServerMessage) -> bool:
+            content = message.server_content
+            if not content:
+                return False
+            return bool(
+                content.turn_complete
+                or content.generation_complete
+                or content.waiting_for_input
+            )
+
+        async for server_message in session.receive():
+            chunks = extract_text_chunks(server_message)
+            if stream and printer:
+                printer.feed(chunks)
             else:
-                buffered_audio.extend(audio_chunks)
-        elif audio_chunks:
-            audio_seen = True
-        log_misc_events(server_message, verbose=verbose)
-    if stream and printer:
-        printer.finish()
-    else:
-        text = "".join(buffer).strip()
-        if text:
-            print("model>", text)
-        elif audio_seen:
-            print("model> [audio response]")
-    if audio_player and buffered_audio:
-        for mime, data in buffered_audio:
-            await audio_player.play(mime, data)
+                buffer.extend(chunks)
+            audio_chunks = extract_audio_chunks(server_message)
+            if audio_chunks:
+                audio_seen = True
+                for mime, data in audio_chunks:
+                    if audio_mime and mime != audio_mime:
+                        await flush_audio()
+                    audio_mime = mime
+                    audio_buffer.append(data)
+            log_misc_events(server_message, verbose=verbose)
+            if should_flush(server_message):
+                await flush_audio()
+
+        if stream and printer:
+            printer.finish()
+        else:
+            text = "".join(buffer).strip()
+            if text:
+                print("model>", text)
+            elif audio_seen:
+                print("model> [audio response]")
+        if audio_buffer:
+            await flush_audio()
 
 
 def parse_audio_metadata(
@@ -341,9 +362,10 @@ class AudioPlayer:
         self.preferred_channels = preferred_channels
         self.device = device
 
-    async def play(self, mime_type: str, data: bytes) -> None:
-        if not self.enabled or not data:
+    async def play_buffer(self, mime_type: str, chunks: List[bytes]) -> None:
+        if not self.enabled or not chunks:
             return
+        payload = b"".join(chunks)
         base, sample_rate, channels = parse_audio_metadata(
             mime_type, self.preferred_rate, self.preferred_channels
         )
@@ -355,7 +377,7 @@ class AudioPlayer:
             return
         await asyncio.to_thread(
             self._play_blocking,
-            data,
+            payload,
             sample_rate,
             channels,
         )
@@ -370,39 +392,59 @@ class AudioPlayer:
         self.sd.wait()
 
 
-async def record_microphone(
-    duration_seconds: float,
+async def stream_microphone(
+    session: genai.live.AsyncSession,
+    *,
     samplerate: int,
     channels: int,
-    device: int | None = None,
-) -> bytes:
+    chunk_seconds: float,
+    device: int | None,
+    stop_event: asyncio.Event,
+) -> None:
     try:
         import sounddevice as sd
-        import numpy as np
     except ImportError as exc:  # pragma: no cover - import guard
         raise SystemExit(
             "sounddevice and numpy are required for speech mode. "
             "Install them with 'pip install sounddevice numpy'."
         ) from exc
 
-    if duration_seconds <= 0:
-        raise ValueError("duration_seconds must be positive.")
+    if chunk_seconds <= 0:
+        raise ValueError("chunk_seconds must be positive.")
 
-    frames = int(duration_seconds * samplerate)
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
 
-    def _record() -> bytes:
-        recording = sd.rec(
-            frames,
+    def callback(indata, frames, time_info, status):  # pragma: no cover - I/O hook
+        if status:
+            print(f"mic> {status}")
+        loop.call_soon_threadsafe(queue.put_nowait, bytes(indata))
+
+    block_frames = max(1, int(samplerate * chunk_seconds))
+    try:
+        with sd.RawInputStream(
             samplerate=samplerate,
             channels=channels,
             dtype="int16",
+            blocksize=block_frames,
+            callback=callback,
             device=device,
-        )
-        sd.wait()
-        arr = np.array(recording, copy=True)
-        return arr.tobytes()
-
-    return await asyncio.to_thread(_record)
+        ):
+            while not stop_event.is_set():
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+                if not chunk:
+                    continue
+                blob = types.Blob(
+                    data=chunk,
+                    mime_type=f"audio/pcm;rate={samplerate}",
+                )
+                await session.send_realtime_input(audio=blob)
+    finally:
+        with contextlib.suppress(Exception):
+            await session.send_realtime_input(audio_stream_end=True)
 
 
 async def text_live_loop(
@@ -465,64 +507,40 @@ async def speech_live_loop(
         device=output_device,
     )
     print(
-        "system> Speech mode. Press Enter to record audio, "
-        "or type text manually. Use :q or Ctrl+C to exit."
+        "system> Speech mode live. Start speaking any time (Ctrl+C to exit). "
+        "Use --chunk-seconds to tune mic responsiveness."
     )
+    stop_event = asyncio.Event()
     async with client.aio.live.connect(model=model, config=config) as session:
-        while True:
-            try:
-                user_input = await ainput("you (Enter=record)> ")
-            except (EOFError, KeyboardInterrupt):
-                print("\nsystem> Exiting.")
-                return
-            lowered = user_input.strip().lower()
-            if lowered in {":q", ":quit", ":exit"}:
-                print("system> Bye!")
-                return
-            if user_input.strip():
-                await session.send_client_content(
-                    turns=[
-                        types.Content(
-                            role="user",
-                            parts=[types.Part(text=user_input.strip())],
-                        )
-                    ],
-                    turn_complete=True,
-                )
-                await handle_responses(
-                    session,
-                    stream=stream,
-                    printer=printer,
-                    verbose=verbose,
-                    audio_player=player,
-                )
-                continue
-            try:
-                print(f"system> Recording for {clip_seconds:.1f} s…")
-                audio_bytes = await record_microphone(
-                    duration_seconds=clip_seconds,
-                    samplerate=sample_rate,
-                    channels=mic_channels,
-                    device=input_device,
-                )
-            except Exception as exc:  # pragma: no cover - runtime feedback
-                print(f"system> Recording failed: {exc}")
-                continue
-            if not audio_bytes:
-                print("system> No audio captured, try again.")
-                continue
-            blob = types.Blob(
-                data=audio_bytes,
-                mime_type=f"audio/pcm;rate={sample_rate}",
+        mic_task = asyncio.create_task(
+            stream_microphone(
+                session,
+                samplerate=sample_rate,
+                channels=mic_channels,
+                chunk_seconds=clip_seconds,
+                device=input_device,
+                stop_event=stop_event,
             )
-            await session.send_realtime_input(audio=blob)
-            await session.send_realtime_input(audio_stream_end=True)
-            await handle_responses(
+        )
+        # Hardware buttons can call `session.send_realtime_input(audio_stream_end=True)`
+        # to force a turn; wire that trigger into this context later.
+        response_task = asyncio.create_task(
+            handle_responses(
                 session,
                 stream=stream,
                 printer=printer,
                 verbose=verbose,
                 audio_player=player,
+            )
+        )
+        try:
+            await asyncio.gather(mic_task, response_task)
+        finally:
+            stop_event.set()
+            mic_task.cancel()
+            response_task.cancel()
+            await asyncio.gather(
+                mic_task, response_task, return_exceptions=True
             )
 
 
