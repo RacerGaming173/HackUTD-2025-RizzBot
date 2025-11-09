@@ -20,7 +20,7 @@ def retrieve_response(prior_inputs, prior_responses):
         contents=prompt,
     )
     
-    response_string = response.text[len("AI Suggestion: "):] if "AI Suggestion: " in response.text else response.text
+    # response_string = response.text[len("AI Suggestion: "):] if "AI Suggestion: " in response.text else response.text
     response_string = response_string.replace('"', "")
 
     prior_inputs.append(input_conversation)
