@@ -3,7 +3,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import os
 import subprocess
-from gemini import retrieve_response
+from gemini import retrieve_response, get_convo_rating
 
 load_dotenv()
 
@@ -16,14 +16,17 @@ while True:
     client = OpenAI()
     inputs = []
     responses = []
+    conversation = []
 
     with client.audio.speech.with_streaming_response.create(
         model="gpt-4o-mini-tts",
         voice="coral",
-        input=retrieve_response(inputs, responses),
+        input=retrieve_response(inputs, responses, conversation),
         instructions="Speak in a cheerful and positive tone.",
         response_format="wav"
     ) as response:
         response.stream_to_file(speech_file_path)
+
+    get_convo_rating(conversation)
 
     subprocess.run(["aplay", speech_file_path])

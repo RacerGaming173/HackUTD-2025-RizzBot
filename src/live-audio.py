@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal Gemini Live session driver for text or speech-to-speech chats."""
+"""Gemini Live CLI for text or speech (open-mic) interactions."""
 
 from __future__ import annotations
 
@@ -28,13 +28,9 @@ DEFAULT_MODEL = "models/gemini-2.0-flash-exp"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Start a Gemini Live session (text today, audio tomorrow)."
+        description="Start a Gemini Live session (text or speech)."
     )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        help=f"Model to use (default: {DEFAULT_MODEL}).",
-    )
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--response-modalities",
         default="TEXT",
@@ -43,31 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--system-prompt",
         default=None,
-        help="Optional system instruction injected into the live session.",
+        help="System instruction inserted into the session.",
     )
     parser.add_argument(
         "--system-prompt-file",
         default=None,
-        help="Path to a file containing the system prompt (overrides --system-prompt).",
+        help="File containing the system prompt (overrides --system-prompt).",
     )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="Optional temperature override.",
-    )
-    parser.add_argument(
-        "--top-p",
-        type=float,
-        default=None,
-        help="Optional top-p override.",
-    )
-    parser.add_argument(
-        "--max-output-tokens",
-        type=int,
-        default=None,
-        help="Optional max_output_tokens override.",
-    )
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--top-k", type=float, default=None)
+    parser.add_argument("--max-output-tokens", type=int, default=None)
     parser.add_argument(
         "--log-events",
         action="store_true",
@@ -77,52 +59,58 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["text", "speech"],
         default="text",
-        help="Interaction mode. 'speech' records mic input and plays audio replies.",
+        help="text mode (type/see replies) or speech (open mic).",
     )
     parser.add_argument(
         "--stream",
         action="store_true",
-        help="Stream tokens live (default prints each response once it finishes).",
+        help="Stream text tokens as they arrive (default prints once per turn).",
     )
     parser.add_argument(
         "--clip-seconds",
         type=float,
         default=0.3,
-        help="Chunk size (seconds) sent from the microphone in speech mode.",
+        help="Microphone chunk size in seconds for speech mode.",
+    )
+    parser.add_argument(
+        "--playback-chunk-seconds",
+        type=float,
+        default=0.6,
+        help="Buffered audio duration (seconds) before playback starts.",
     )
     parser.add_argument(
         "--sample-rate",
         type=int,
         default=16000,
-        help="Sample rate for captured and generated audio in speech mode.",
+        help="Microphone sample rate.",
     )
     parser.add_argument(
         "--mic-channels",
         type=int,
         default=1,
-        help="Number of microphone channels to record (1 = mono).",
+        help="Microphone channel count (1 = mono).",
     )
     parser.add_argument(
         "--voice",
         default=None,
-        help="Optional prebuilt voice name for audio responses (speech mode).",
+        help="Name of a prebuilt Gemini voice (speech responses).",
     )
     parser.add_argument(
         "--input-device",
         type=int,
         default=None,
-        help="Optional PortAudio device index for microphone (speech mode).",
+        help="PortAudio device index for the microphone.",
     )
     parser.add_argument(
         "--output-device",
         type=int,
         default=None,
-        help="Optional PortAudio device index for playback (speech mode).",
+        help="PortAudio device index for playback.",
     )
     parser.add_argument(
         "--no-playback",
         action="store_true",
-        help="Do not play synthesized audio out loud (still prints transcript).",
+        help="Do not play audio responses (speech mode still prints transcripts).",
     )
     return parser.parse_args()
 
@@ -147,10 +135,9 @@ def resolve_system_prompt(args: argparse.Namespace) -> str | None:
         if not path.is_file():
             raise SystemExit(f"System prompt file not found: {path}")
         try:
-            text = path.read_text(encoding="utf-8").strip()
+            return path.read_text(encoding="utf-8").strip()
         except OSError as exc:
             raise SystemExit(f"Failed to read system prompt file: {exc}") from exc
-        return text
     return args.system_prompt
 
 
@@ -163,18 +150,23 @@ def build_config(args: argparse.Namespace) -> types.LiveConnectConfig:
     ] or ["TEXT"]
     if wants_audio_out:
         response_modalities = ["AUDIO"]
+
     gen_kwargs = {
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
         "max_output_tokens": args.max_output_tokens,
     }
-    gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
+    gen_kwargs = {key: val for key, val in gen_kwargs.items() if val is not None}
+
     config_kwargs: dict = {"response_modalities": response_modalities}
     if gen_kwargs:
         config_kwargs["generation_config"] = types.GenerationConfig(**gen_kwargs)
+
     system_prompt = resolve_system_prompt(args)
     if system_prompt:
         config_kwargs["system_instruction"] = system_prompt
+
     if args.voice:
         config_kwargs["speech_config"] = types.SpeechConfig(
             voice_config=types.VoiceConfig(
@@ -183,6 +175,7 @@ def build_config(args: argparse.Namespace) -> types.LiveConnectConfig:
                 )
             )
         )
+
     return types.LiveConnectConfig(**config_kwargs)
 
 
@@ -193,7 +186,7 @@ async def ainput(prompt: str) -> str:
 
 @dataclass
 class TurnPrinter:
-    """Keeps CLI output tidy while streaming chunks."""
+    """Simple helper to stream text tokens with a clean prefix."""
 
     mid_turn: bool = False
 
@@ -276,25 +269,52 @@ async def handle_responses(
     printer: TurnPrinter | None,
     verbose: bool = False,
     audio_player: "AudioPlayer | None" = None,
+    audio_chunk_seconds: float | None = None,
+    continuous: bool = False,
 ) -> None:
     if stream and not printer:
         printer = TurnPrinter()
+
     while True:
         if stream and printer:
             printer.start()
-        buffer: List[str] = []
-        audio_buffer: List[bytes] = []
+
+        text_buffer: List[str] = []
+        audio_buffer = bytearray()
         audio_mime: str | None = None
+        bytes_per_frame = 2
+        chunk_threshold_bytes: int | None = None
         audio_seen = False
+        turn_completed = False
 
-        async def flush_audio() -> None:
-            nonlocal audio_buffer, audio_mime
-            if audio_player and audio_buffer and audio_mime:
-                await audio_player.play_buffer(audio_mime, audio_buffer)
-            audio_buffer = []
+        async def flush_ready() -> None:
+            nonlocal audio_buffer, audio_mime, chunk_threshold_bytes, bytes_per_frame
+            if not audio_buffer or not audio_mime:
+                audio_buffer = bytearray()
+                audio_mime = None
+                chunk_threshold_bytes = None
+                bytes_per_frame = 2
+                return
+            if audio_player:
+                await audio_player.play_buffer(audio_mime, [bytes(audio_buffer)])
+            audio_buffer = bytearray()
             audio_mime = None
+            chunk_threshold_bytes = None
+            bytes_per_frame = 2
 
-        def should_flush(message: types.LiveServerMessage) -> bool:
+        async def flush_threshold() -> None:
+            if (
+                not audio_player
+                or chunk_threshold_bytes is None
+                or not audio_mime
+            ):
+                return
+            while len(audio_buffer) >= chunk_threshold_bytes:
+                chunk = bytes(audio_buffer[:chunk_threshold_bytes])
+                del audio_buffer[:chunk_threshold_bytes]
+                await audio_player.play_buffer(audio_mime, [chunk])
+
+        def should_end_turn(message: types.LiveServerMessage) -> bool:
             content = message.server_content
             if not content:
                 return False
@@ -305,33 +325,63 @@ async def handle_responses(
             )
 
         async for server_message in session.receive():
-            chunks = extract_text_chunks(server_message)
+            text_chunks = extract_text_chunks(server_message)
             if stream and printer:
-                printer.feed(chunks)
+                printer.feed(text_chunks)
             else:
-                buffer.extend(chunks)
+                text_buffer.extend(text_chunks)
+
             audio_chunks = extract_audio_chunks(server_message)
             if audio_chunks:
                 audio_seen = True
                 for mime, data in audio_chunks:
                     if audio_mime and mime != audio_mime:
-                        await flush_audio()
-                    audio_mime = mime
-                    audio_buffer.append(data)
+                        await flush_ready()
+                    if not audio_mime:
+                        audio_mime = mime
+                        _, rate, channels = parse_audio_metadata(
+                            mime, 16000, 1
+                        )
+                        bytes_per_frame = max(1, channels) * 2
+                        if (
+                            audio_player
+                            and audio_chunk_seconds
+                            and audio_chunk_seconds > 0
+                        ):
+                            window = max(0.05, audio_chunk_seconds)
+                            chunk_threshold_bytes = max(
+                                bytes_per_frame,
+                                int(rate * window * bytes_per_frame),
+                            )
+                        else:
+                            chunk_threshold_bytes = None
+                    audio_buffer.extend(data)
+                    await flush_threshold()
+
             log_misc_events(server_message, verbose=verbose)
-            if should_flush(server_message):
-                await flush_audio()
+            if should_end_turn(server_message):
+                await flush_ready()
+                turn_completed = True
+                break
+
+        if not turn_completed:
+            await flush_ready()
+            return
 
         if stream and printer:
             printer.finish()
         else:
-            text = "".join(buffer).strip()
+            text = "".join(text_buffer).strip()
             if text:
                 print("model>", text)
             elif audio_seen:
                 print("model> [audio response]")
+
         if audio_buffer:
-            await flush_audio()
+            await flush_ready()
+
+        if not continuous:
+            return
 
 
 def parse_audio_metadata(
@@ -382,10 +432,14 @@ class AudioPlayer:
         self.preferred_channels = preferred_channels
         self.device = device
 
-    async def play_buffer(self, mime_type: str, chunks: List[bytes]) -> None:
-        if not self.enabled or not chunks:
+    async def play_buffer(
+        self, mime_type: str, chunks: Iterable[bytes]
+    ) -> None:
+        if not self.enabled:
             return
         payload = b"".join(chunks)
+        if not payload:
+            return
         base, sample_rate, channels = parse_audio_metadata(
             mime_type, self.preferred_rate, self.preferred_channels
         )
@@ -402,7 +456,9 @@ class AudioPlayer:
             channels,
         )
 
-    def _play_blocking(self, data: bytes, sample_rate: int, channels: int) -> None:
+    def _play_blocking(
+        self, data: bytes, sample_rate: int, channels: int
+    ) -> None:
         if not data:
             return
         audio = self.np.frombuffer(data, dtype=self.np.int16)
@@ -435,7 +491,7 @@ async def stream_microphone(
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[bytes] = asyncio.Queue()
 
-    def callback(indata, frames, time_info, status):  # pragma: no cover - I/O hook
+    def callback(indata, frames, time_info, status):  # pragma: no cover
         if status:
             print(f"mic> {status}")
         loop.call_soon_threadsafe(queue.put_nowait, bytes(indata))
@@ -510,14 +566,15 @@ async def speech_live_loop(
     model: str,
     config: types.LiveConnectConfig,
     *,
-    verbose: bool = False,
-    stream: bool = False,
-    clip_seconds: float,
+    verbose: bool,
+    stream: bool,
+    chunk_seconds: float,
     sample_rate: int,
     mic_channels: int,
     playback_enabled: bool,
     input_device: int | None,
     output_device: int | None,
+    playback_chunk_seconds: float,
 ) -> None:
     printer = TurnPrinter() if stream else None
     player = AudioPlayer(
@@ -527,23 +584,26 @@ async def speech_live_loop(
         device=output_device,
     )
     print(
-        "system> Speech mode live. Start speaking any time (Ctrl+C to exit). "
-        "Use --chunk-seconds to tune mic responsiveness."
+        "system> Speech mode live. Start talking any time (Ctrl+C to exit). "
+        "Use --clip-seconds/--playback-chunk-seconds to tune latency."
     )
+
     stop_event = asyncio.Event()
+
     async with client.aio.live.connect(model=model, config=config) as session:
         mic_task = asyncio.create_task(
             stream_microphone(
                 session,
                 samplerate=sample_rate,
                 channels=mic_channels,
-                chunk_seconds=clip_seconds,
+                chunk_seconds=chunk_seconds,
                 device=input_device,
                 stop_event=stop_event,
             )
         )
-        # Hardware buttons can call `session.send_realtime_input(audio_stream_end=True)`
-        # to force a turn; wire that trigger into this context later.
+        # Future hardware buttons can call session.send_realtime_input(
+        #     audio_stream_end=True
+        # ) to force a model response.
         response_task = asyncio.create_task(
             handle_responses(
                 session,
@@ -551,14 +611,17 @@ async def speech_live_loop(
                 printer=printer,
                 verbose=verbose,
                 audio_player=player,
+                audio_chunk_seconds=playback_chunk_seconds,
+                continuous=True,
             )
         )
+
         try:
             await asyncio.gather(mic_task, response_task)
         finally:
             stop_event.set()
-            mic_task.cancel()
-            response_task.cancel()
+            for task in (mic_task, response_task):
+                task.cancel()
             await asyncio.gather(
                 mic_task, response_task, return_exceptions=True
             )
@@ -569,6 +632,7 @@ async def main_async() -> None:
     api_key = load_api_key()
     client = genai.Client(api_key=api_key)
     config = build_config(args)
+
     if args.mode == "speech":
         await speech_live_loop(
             client=client,
@@ -576,12 +640,13 @@ async def main_async() -> None:
             config=config,
             verbose=args.log_events,
             stream=args.stream,
-            clip_seconds=args.clip_seconds,
+            chunk_seconds=args.clip_seconds,
             sample_rate=args.sample_rate,
             mic_channels=args.mic_channels,
             playback_enabled=not args.no_playback,
             input_device=args.input_device,
             output_device=args.output_device,
+            playback_chunk_seconds=args.playback_chunk_seconds,
         )
     else:
         await text_live_loop(
