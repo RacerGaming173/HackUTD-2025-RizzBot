@@ -9,6 +9,7 @@ import base64
 import contextlib
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Tuple
 
 from dotenv import load_dotenv
@@ -43,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         "--system-prompt",
         default=None,
         help="Optional system instruction injected into the live session.",
+    )
+    parser.add_argument(
+        "--system-prompt-file",
+        default=None,
+        help="Path to a file containing the system prompt (overrides --system-prompt).",
     )
     parser.add_argument(
         "--temperature",
@@ -135,6 +141,19 @@ def load_api_key() -> str:
     return key
 
 
+def resolve_system_prompt(args: argparse.Namespace) -> str | None:
+    if args.system_prompt_file:
+        path = Path(args.system_prompt_file)
+        if not path.is_file():
+            raise SystemExit(f"System prompt file not found: {path}")
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise SystemExit(f"Failed to read system prompt file: {exc}") from exc
+        return text
+    return args.system_prompt
+
+
 def build_config(args: argparse.Namespace) -> types.LiveConnectConfig:
     wants_audio_out = args.mode == "speech"
     response_modalities = [
@@ -153,8 +172,9 @@ def build_config(args: argparse.Namespace) -> types.LiveConnectConfig:
     config_kwargs: dict = {"response_modalities": response_modalities}
     if gen_kwargs:
         config_kwargs["generation_config"] = types.GenerationConfig(**gen_kwargs)
-    if args.system_prompt:
-        config_kwargs["system_instruction"] = args.system_prompt
+    system_prompt = resolve_system_prompt(args)
+    if system_prompt:
+        config_kwargs["system_instruction"] = system_prompt
     if args.voice:
         config_kwargs["speech_config"] = types.SpeechConfig(
             voice_config=types.VoiceConfig(

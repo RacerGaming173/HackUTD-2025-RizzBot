@@ -1,18 +1,22 @@
 import subprocess
 import time
-
+import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Use the same device & params that worked for you
+current_file_path = os.path.abspath(__file__)
+current_directory = os.path.dirname(current_file_path)
+parent_directory = os.path.dirname(current_directory)
+input_file_path = os.path.join(parent_directory, "tmp.wav")
+
 ARECORD_CMD = [
     "arecord",
-    "-D", "plughw:2,0",
+    "-D", "plughw:1,0",
     "-f", "S16_LE",
     "-r", "16000",
     "-c", "1",
     "-d", "10",
-    "tmp.wav",
+    input_file_path,
 ]
 
 load_dotenv()
